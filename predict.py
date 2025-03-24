@@ -13,6 +13,7 @@ from PIL import Image
 
 MODEL_CACHE = "FLUX.1-schnell"
 MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
+HALF_PRECISION_CACHE = "FLUX.1-schnell-fp16"  # New location for half precision model
 
 def download_weights(url, dest):
     start = time.time()
@@ -26,20 +27,36 @@ class Predictor(BasePredictor):
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
 
-        # Download the model weights if they don't exist
-        if not os.path.exists(MODEL_CACHE):
-            download_weights(MODEL_URL, MODEL_CACHE)
+        # Check if half precision model exists
+        if os.path.exists(HALF_PRECISION_CACHE):
+            print(f"Loading half precision model from {HALF_PRECISION_CACHE}")
+            model_path = HALF_PRECISION_CACHE
+        else:
+            # Download the model weights if they don't exist
+            if not os.path.exists(MODEL_CACHE):
+                download_weights(MODEL_URL, MODEL_CACHE)
+            
+            # Use original model path
+            print(f"Using original model from {MODEL_CACHE}")
+            model_path = MODEL_CACHE
         
         # Enable TensorFloat-32 for faster computation on Ampere GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
         
+        # Set memory optimization settings
+        torch.cuda.empty_cache()
+        
         # Load the model with memory optimizations
-        print("Loading Flux.schnell Pipeline")
+        print(f"Loading Flux.schnell Pipeline from {model_path}")
         self.pipe = FluxPipeline.from_pretrained(
-            MODEL_CACHE,
+            model_path,
             torch_dtype=torch.float16,  # Use half precision
             low_cpu_mem_usage=True,     # Optimize CPU memory usage during loading
         )
+        
+        # Move to CUDA in a memory-efficient way
+        print("Moving model to CUDA...")
+        self.pipe.to("cuda")
         
         # Add hooks to log tensor shapes during forward pass
         self.tensor_shapes = {}
@@ -58,9 +75,6 @@ class Predictor(BasePredictor):
             self.pipe.transformer.register_forward_hook(log_shape_hook("transformer"))
             if hasattr(self.pipe.transformer, "x_embedder"):
                 self.pipe.transformer.x_embedder.register_forward_hook(log_shape_hook("x_embedder"))
-        
-        # Move to CUDA after loading
-        self.pipe = self.pipe.to("cuda")
         
         print(f"setup took: ", time.time() - start)
 
