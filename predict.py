@@ -14,6 +14,7 @@ from PIL import Image
 MODEL_CACHE = "FLUX.1-schnell"
 MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
 HALF_PRECISION_CACHE = "FLUX.1-schnell-fp16"  # New location for half precision model
+# INT8_CACHE = "FLUX.1-schnell-int8"  # New INT8 quantized model path (commented out)
 
 def download_weights(url, dest):
     start = time.time()
@@ -22,17 +23,40 @@ def download_weights(url, dest):
     subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
     print("downloading took: ", time.time() - start)
 
+# def convert_to_int8():
+#     """Convert the model to INT8 quantization using the conversion script"""
+#     print("Converting model to INT8 quantization...")
+#     try:
+#         # Check if the conversion script exists
+#         if not os.path.exists("convert_model_int8.py"):
+#             print("INT8 conversion script not found, skipping conversion")
+#             return False
+            
+#         # Run the conversion script
+#         result = subprocess.run(
+#             ["python3", "convert_model_int8.py"], 
+#             capture_output=True, 
+#             text=True,
+#             check=True
+#         )
+#         print(result.stdout)
+#         return os.path.exists(INT8_CACHE)
+#     except subprocess.CalledProcessError as e:
+#         print(f"Error converting model to INT8: {e}")
+#         print(f"Error output: {e.stderr}")
+#         return False
+
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        start = time.time()
-
-        # Check if half precision model exists
+        start_time = time.time()
+        
+        # Check for models in order of preference: FP16, original
         if os.path.exists(HALF_PRECISION_CACHE):
             print(f"Loading half precision model from {HALF_PRECISION_CACHE}")
             model_path = HALF_PRECISION_CACHE
         else:
-            # Download the model weights if they don't exist
+            # Download original model if needed
             if not os.path.exists(MODEL_CACHE):
                 download_weights(MODEL_URL, MODEL_CACHE)
             
@@ -76,7 +100,7 @@ class Predictor(BasePredictor):
             if hasattr(self.pipe.transformer, "x_embedder"):
                 self.pipe.transformer.x_embedder.register_forward_hook(log_shape_hook("x_embedder"))
         
-        print(f"setup took: ", time.time() - start)
+        print(f"setup took: ", time.time() - start_time)
 
     @staticmethod
     def make_multiple_of_16(n):
