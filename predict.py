@@ -12,6 +12,7 @@ from diffusers import FluxPipeline
 from PIL import Image
 import shutil
 import tempfile
+import librosa
 
 MODEL_CACHE = "FLUX.1-schnell"
 MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
@@ -109,6 +110,66 @@ class Predictor(BasePredictor):
         """Make sure width and height are multiples of 16 for the model"""
         return ((n + 15) // 16) * 16
 
+    @staticmethod
+    def get_audio_amplitudes(audio_file, frame_rate=10, smoothing=0.8, noise_scale=0.3, loudness_type="peak"):
+        """Extract amplitude envelope from an audio file.
+        
+        Args:
+            audio_file: Path to the audio file
+            frame_rate: Number of frames per second to extract
+            smoothing: Smoothing factor (0-1), higher values mean more smoothing
+            noise_scale: Scale factor for the audio amplitudes
+            loudness_type: Type of loudness measurement ('peak' or 'rms')
+            
+        Returns:
+            Normalized amplitude values
+        """
+        # Load audio file
+        y, sr = librosa.load(audio_file, sr=22050)
+        
+        # Calculate hop length based on frame rate
+        hop_length = int(22050 / frame_rate)
+        
+        # Initialize smoothed intensity
+        smoothed_intensity = 0
+        smoothed_intensities = []
+        
+        if loudness_type == "peak":
+            # Get amplitude envelope
+            amplitude_envelope = []
+            
+            # Calculate amplitude envelope for each frame
+            for i in range(0, len(y), hop_length):
+                current_frame = np.abs(y[i:i+hop_length])
+                if len(current_frame) > 0:
+                    amplitude_envelope_current_frame = np.max(current_frame)
+                    amplitude_envelope.append(amplitude_envelope_current_frame)
+            
+            # Convert to numpy array
+            amplitude_envelope = np.array(amplitude_envelope)
+            
+            # Normalize
+            if amplitude_envelope.max() > 0:
+                normalized_amplitudes = amplitude_envelope / amplitude_envelope.max()
+            else:
+                normalized_amplitudes = np.zeros_like(amplitude_envelope)
+        else:
+            # Get RMS (root mean square) - energy
+            rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length)
+            
+            # Normalize
+            if rms[0].max() > 0:
+                normalized_amplitudes = rms[0] / rms[0].max()
+            else:
+                normalized_amplitudes = np.zeros_like(rms[0])
+        
+        # Apply smoothing and scaling
+        for amplitude in normalized_amplitudes:
+            smoothed_intensity = (smoothed_intensity * smoothing) + (amplitude * (1 - smoothing))
+            smoothed_intensities.append(smoothed_intensity * noise_scale)
+        
+        return np.array(smoothed_intensities)
+
     @torch.inference_mode()
     def generate_interpolated_images(
         self,
@@ -117,8 +178,13 @@ class Predictor(BasePredictor):
         height: int,
         seed1: int,
         seed2: int,
-        interpolation_steps: int,
-        interpolation_strength: float,
+        interpolation_steps: int = None,
+        interpolation_strength: float = None,
+        audio_file: Path = None,
+        audio_smoothing: float = 0.8,
+        audio_noise_scale: float = 0.3,
+        audio_loudness_type: str = "peak",
+        fps: int = 10,
     ) -> List[Image.Image]:
         """Generate a series of interpolated images between two random seeds.
         
@@ -128,8 +194,13 @@ class Predictor(BasePredictor):
             height: Height of the generated image
             seed1: First random seed for interpolation
             seed2: Second random seed for interpolation
-            interpolation_steps: Number of interpolation steps between seeds
-            interpolation_strength: How far to interpolate towards the second seed
+            interpolation_steps: Number of interpolation steps between seeds (ignored if audio_file is provided)
+            interpolation_strength: How far to interpolate towards the second seed (ignored if audio_file is provided)
+            audio_file: Path to audio file for audio-driven interpolation
+            audio_smoothing: Smoothing factor for audio amplitudes
+            audio_noise_scale: Scale factor for audio amplitudes
+            audio_loudness_type: Type of loudness measurement ('peak' or 'rms')
+            fps: Frames per second for audio-driven interpolation
             
         Returns:
             List of PIL images generated through interpolation
@@ -165,10 +236,26 @@ class Predictor(BasePredictor):
         # Initialize list to store all generated images
         all_images = []
         
-        # Generate images for each interpolation step (including endpoints)
-        total_steps = interpolation_steps
+        # Determine interpolation values based on audio file or steps
+        if audio_file is not None:
+            # Get audio amplitudes to drive interpolation
+            interpolation_values = self.get_audio_amplitudes(
+                audio_file, 
+                frame_rate=fps,
+                smoothing=audio_smoothing,
+                noise_scale=audio_noise_scale,
+                loudness_type=audio_loudness_type
+            )
+            total_steps = len(interpolation_values)
+            print(f"Using audio file for interpolation with {total_steps} frames")
+        else:
+            # Use linear interpolation with fixed steps
+            total_steps = interpolation_steps
+            interpolation_values = np.linspace(0, interpolation_strength, total_steps + 1)
+            print(f"Using fixed interpolation with {total_steps} steps")
         
-        for i, t in enumerate(np.linspace(0, interpolation_strength, total_steps + 1)):
+        # Generate images for each interpolation step
+        for i, t in enumerate(interpolation_values):
             # For t=0, use latent1 directly
             if t == 0:
                 current_latent = latent1
@@ -184,7 +271,7 @@ class Predictor(BasePredictor):
                 # Reshape back to original shape
                 current_latent = interpolated_latent_flat.reshape(latent1.shape)
             
-            print(f"Generating image {i+1}/{total_steps+1} with t={t}")
+            print(f"Generating image {i+1}/{len(interpolation_values)} with t={t}")
             
             # Log detailed shape information
             print(f"Current latent shape: {current_latent.shape}")
@@ -230,10 +317,18 @@ class Predictor(BasePredictor):
         height: int = Input(description="Height of the generated image", default=768),
         seed1: int = Input(description="First random seed for interpolation", default=1234567890),
         seed2: int = Input(description="Second random seed for interpolation", default=9876543210),
-        interpolation_steps: int = Input(description="Number of interpolation steps between seeds", default=4),
-        interpolation_strength: float = Input(description="How far to interpolate towards the second seed (0.05 = 5%)", default=0.05),
+        interpolation_steps: int = Input(description="Number of interpolation steps between seeds (ignored if audio_file is provided)", default=4),
+        interpolation_strength: float = Input(description="How far to interpolate towards the second seed (0.05 = 5%) (ignored if audio_file is provided)", default=0.05),
+        audio_file: Path = Input(description="Audio file to drive interpolation (optional)", default=None),
+        audio_smoothing: float = Input(description="Smoothing factor for audio (0-1, higher = more smoothing)", default=0.8),
+        audio_noise_scale: float = Input(description="Scale factor for audio influence (0-1)", default=0.3),
+        audio_loudness_type: str = Input(
+            description="Type of audio loudness measurement to use",
+            choices=["peak", "rms"],
+            default="peak"
+        ),
         create_video: bool = Input(description="Create a video from the interpolated images", default=True),
-        fps: int = Input(description="Frames per second for the video", default=5),
+        fps: int = Input(description="Frames per second for the video", default=10),
         output_format: str = Input(
             description="Format of the output image",
             choices=["webp", "jpg", "png"],
@@ -242,8 +337,17 @@ class Predictor(BasePredictor):
     ) -> Path:
         print(f"Using seed1: {seed1}")
         print(f"Using seed2: {seed2}")
-        print(f"Interpolation steps: {interpolation_steps}")
-        print(f"Interpolation strength: {interpolation_strength * 100}%")
+        
+        if audio_file:
+            print(f"Using audio file: {audio_file}")
+            print(f"Audio smoothing: {audio_smoothing}")
+            print(f"Audio noise scale: {audio_noise_scale}")
+            print(f"Audio loudness type: {audio_loudness_type}")
+            print(f"FPS: {fps}")
+        else:
+            print(f"Interpolation steps: {interpolation_steps}")
+            print(f"Interpolation strength: {interpolation_strength * 100}%")
+            
         print(f"Prompt: {prompt}")
         print(f"Dimensions: {width}x{height}")
         
@@ -258,6 +362,11 @@ class Predictor(BasePredictor):
                 seed2=seed2,
                 interpolation_steps=interpolation_steps,
                 interpolation_strength=interpolation_strength,
+                audio_file=audio_file,
+                audio_smoothing=audio_smoothing,
+                audio_noise_scale=audio_noise_scale,
+                audio_loudness_type=audio_loudness_type,
+                fps=fps,
             )
             
             # Save images to temporary directory
@@ -271,7 +380,13 @@ class Predictor(BasePredictor):
             if create_video and len(image_paths) > 1:
                 # Create video in the temporary directory
                 video_path = f"{output_dir}/interpolation_video.mp4"
-                create_video_from_images(image_paths, video_path, fps=fps)
+                
+                if audio_file and os.path.exists(audio_file):
+                    # Create video with audio
+                    create_video_from_images(image_paths, video_path, fps=fps, audio_file=audio_file)
+                else:
+                    # Create video without audio
+                    create_video_from_images(image_paths, video_path, fps=fps)
                 
                 # Create a path in the Cog-managed directory for the final output
                 final_video_path = Path(f"/tmp/output_video_{int(time.time())}.mp4")
@@ -295,7 +410,7 @@ class Predictor(BasePredictor):
             
             return final_image_paths
 
-def create_video_from_images(image_paths, output_path, fps=10):
+def create_video_from_images(image_paths, output_path, fps=10, audio_file=None):
     """Create a video from a list of image paths using ffmpeg"""
     # Create a temporary directory for frame numbering
     tmp_dir = '/tmp/frames'
@@ -313,12 +428,24 @@ def create_video_from_images(image_paths, output_path, fps=10):
         'ffmpeg', 
         '-y',  # Overwrite output file if it exists
         '-framerate', str(fps),
-        '-i', f"{tmp_dir}/frame_%04d.{image_paths[0].split('.')[-1]}", 
+        '-i', f"{tmp_dir}/frame_%04d.{image_paths[0].split('.')[-1]}"
+    ]
+    
+    # Add audio input if provided
+    if audio_file and os.path.exists(audio_file):
+        cmd.extend(['-i', str(audio_file), '-map', '0:v', '-map', '1:a', '-shortest'])
+    
+    # Add encoding options
+    cmd.extend([
         '-c:v', 'libx264',
         '-pix_fmt', 'yuv420p',
-        '-movflags', '+faststart',
-        output_path
-    ]
+        '-movflags', '+faststart'
+    ])
+    
+    # Add output path
+    cmd.append(output_path)
+    
+    # Run ffmpeg command
     subprocess.run(cmd, check=True)
     
     return output_path

@@ -19,5 +19,6 @@ build:
   run:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/latest/download/pget_$(uname -s)_$(uname -m)" && chmod +x /usr/local/bin/pget
     - apt-get update && apt-get install -y ffmpeg
+    - pip install librosa
 
 predict: "predict.py:Predictor"
