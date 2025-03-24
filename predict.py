@@ -1,4 +1,4 @@
-# Prediction interface for Cog ⚙️
+# Prediction interface for Cog 
 # https://github.com/replicate/cog/blob/main/docs/python.md
 
 from cog import BasePredictor, Input, Path
@@ -7,38 +7,12 @@ import time
 import torch
 import subprocess
 import numpy as np
+from typing import List, Union
+from diffusers import FluxPipeline
 from PIL import Image
-from typing import List
-from diffusers import (
-    FluxPipeline,
-    FluxImg2ImgPipeline
-)
-from torchvision import transforms
-from transformers import CLIPImageProcessor
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker
-)
 
-MAX_IMAGE_SIZE = 1440
-MODEL_CACHE = "FLUX.1-dev"
-SAFETY_CACHE = "safety-cache"
-FEATURE_EXTRACTOR = "/src/feature-extractor"
-SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
-MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
-
-ASPECT_RATIOS = {
-    "1:1": (1024, 1024),
-    "16:9": (1344, 768),
-    "21:9": (1536, 640),
-    "3:2": (1216, 832),
-    "2:3": (832, 1216),
-    "4:5": (896, 1088),
-    "5:4": (1088, 896),
-    "3:4": (896, 1152),
-    "4:3": (1152, 896),
-    "9:16": (768, 1344),
-    "9:21": (640, 1536),
-}
+MODEL_CACHE = "FLUX.1-schnell"
+MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
 
 def download_weights(url, dest):
     start = time.time()
@@ -48,186 +22,261 @@ def download_weights(url, dest):
     print("downloading took: ", time.time() - start)
 
 class Predictor(BasePredictor):
-    def setup(self) -> None:
+    def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
 
-        print("Loading safety checker...")
-        if not os.path.exists(SAFETY_CACHE):
-            download_weights(SAFETY_URL, SAFETY_CACHE)
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_CACHE, torch_dtype=torch.float16
-        ).to("cuda")
-        self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
-
-        print("Loading Flux txt2img Pipeline")
+        # Download the model weights if they don't exist
         if not os.path.exists(MODEL_CACHE):
-            download_weights(MODEL_URL, '.')
-        self.txt2img_pipe = FluxPipeline.from_pretrained(
+            download_weights(MODEL_URL, MODEL_CACHE)
+        
+        # Enable TensorFloat-32 for faster computation on Ampere GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Load the model with memory optimizations
+        print("Loading Flux.schnell Pipeline")
+        self.pipe = FluxPipeline.from_pretrained(
             MODEL_CACHE,
-            torch_dtype=torch.bfloat16,
-            cache_dir=MODEL_CACHE
-        ).to("cuda")
-
-        print("Loading Flux img2img pipeline")
-        self.img2img_pipe = FluxImg2ImgPipeline(
-            transformer=self.txt2img_pipe.transformer,
-            scheduler=self.txt2img_pipe.scheduler,
-            vae=self.txt2img_pipe.vae,
-            text_encoder=self.txt2img_pipe.text_encoder,
-            text_encoder_2=self.txt2img_pipe.text_encoder_2,
-            tokenizer=self.txt2img_pipe.tokenizer,
-            tokenizer_2=self.txt2img_pipe.tokenizer_2,
-        ).to("cuda")
-        print("setup took: ", time.time() - start)
-
-    @torch.amp.autocast('cuda')
-    def run_safety_checker(self, image):
-        safety_checker_input = self.feature_extractor(image, return_tensors="pt").to("cuda")
-        np_image = [np.array(val) for val in image]
-        image, has_nsfw_concept = self.safety_checker(
-            images=np_image,
-            clip_input=safety_checker_input.pixel_values.to(torch.float16),
+            torch_dtype=torch.float16,  # Use half precision
+            low_cpu_mem_usage=True,     # Optimize CPU memory usage during loading
         )
-        return image, has_nsfw_concept
-
-    def aspect_ratio_to_width_height(self, aspect_ratio: str) -> tuple[int, int]:
-        return ASPECT_RATIOS[aspect_ratio]
-
-    def get_image(self, image: str):
-        image = Image.open(image).convert("RGB")
-        transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: 2.0 * x - 1.0),
-            ]
-        )
-        img: torch.Tensor = transform(image)
-        return img[None, ...]
+        
+        # Add hooks to log tensor shapes during forward pass
+        self.tensor_shapes = {}
+        
+        def log_shape_hook(name):
+            def hook(module, input, output):
+                if isinstance(input, tuple) and len(input) > 0:
+                    if isinstance(input[0], torch.Tensor):
+                        self.tensor_shapes[f"{name}_input"] = input[0].shape
+                if isinstance(output, torch.Tensor):
+                    self.tensor_shapes[f"{name}_output"] = output.shape
+            return hook
+        
+        # Register hooks on key components
+        if hasattr(self.pipe, "transformer"):
+            self.pipe.transformer.register_forward_hook(log_shape_hook("transformer"))
+            if hasattr(self.pipe.transformer, "x_embedder"):
+                self.pipe.transformer.x_embedder.register_forward_hook(log_shape_hook("x_embedder"))
+        
+        # Move to CUDA after loading
+        self.pipe = self.pipe.to("cuda")
+        
+        print(f"setup took: ", time.time() - start)
 
     @staticmethod
     def make_multiple_of_16(n):
+        """Make sure width and height are multiples of 16 for the model"""
         return ((n + 15) // 16) * 16
 
     @torch.inference_mode()
     def predict(
         self,
         prompt: str = Input(description="Prompt for generated image"),
-        aspect_ratio: str = Input(
-            description="Aspect ratio for the generated image",
-            choices=list(ASPECT_RATIOS.keys()),
-            default="1:1"
-        ),
-        image: Path = Input(
-            description="Input image for image to image mode. The aspect ratio of your output will match this image",
-            default=None,
-        ),
-        prompt_strength: float = Input(
-            description="Prompt strength (or denoising strength) when using image to image. 1.0 corresponds to full destruction of information in image.",
-            ge=0,le=1,default=0.8,
-        ),
-        num_outputs: int = Input(
-            description="Number of images to output.",
-            ge=1,
-            le=4,
-            default=1,
-        ),
-        num_inference_steps: int = Input(
-            description="Number of inference steps",
-            ge=1,le=50,default=28,
-        ),
-        guidance_scale: float = Input(
-            description="Guidance scale for the diffusion process",
-            ge=0,le=10,default=3.5,
-        ),
-        seed: int = Input(description="Random seed. Set for reproducible generation", default=None),
+        width: int = Input(description="Width of the generated image", default=768),
+        height: int = Input(description="Height of the generated image", default=768),
+        seed1: int = Input(description="First random seed for interpolation", default=1234567890),
+        seed2: int = Input(description="Second random seed for interpolation", default=9876543210),
+        interpolation_steps: int = Input(description="Number of interpolation steps between seeds", default=4),
+        interpolation_strength: float = Input(description="How far to interpolate towards the second seed (0.05 = 5%)", default=0.05),
+        create_video: bool = Input(description="Create a video from the interpolated images", default=True),
+        fps: int = Input(description="Frames per second for the video", default=5),
         output_format: str = Input(
-            description="Format of the output images",
+            description="Format of the output image",
             choices=["webp", "jpg", "png"],
-            default="webp",
+            default="png",
         ),
-        output_quality: int = Input(
-            description="Quality when saving the output images, from 0 to 100. 100 is best quality, 0 is lowest quality. Not relevant for .png outputs",
-            default=80,
-            ge=0,
-            le=100,
-        ),
-        disable_safety_checker: bool = Input(
-            description="Disable safety checker for generated images. This feature is only available through the API. See [https://replicate.com/docs/how-does-replicate-work#safety](https://replicate.com/docs/how-does-replicate-work#safety)",
-            default=False,
-        ),
-    ) -> List[Path]:
-        """Run a single prediction on the model"""
-        if seed is None:
-            seed = int.from_bytes(os.urandom(2), "big")
-        print(f"Using seed: {seed}")
-
-        width, height = self.aspect_ratio_to_width_height(aspect_ratio)
-        max_sequence_length=512
-
-        flux_kwargs = {"width": width, "height": height}
+    ) -> Union[Path, List[Path]]:
+        print(f"Using seed1: {seed1}")
+        print(f"Using seed2: {seed2}")
+        print(f"Interpolation steps: {interpolation_steps}")
+        print(f"Interpolation strength: {interpolation_strength * 100}%")
         print(f"Prompt: {prompt}")
-        device = self.txt2img_pipe.device
-
-        if image:
-            pipe = self.img2img_pipe
-            print("img2img mode")
-            init_image = self.get_image(image)
-            width = init_image.shape[-1]
-            height = init_image.shape[-2]
-            print(f"Input image size: {width}x{height}")
-            # Calculate the scaling factor if the image exceeds MAX_IMAGE_SIZE
-            scale = min(MAX_IMAGE_SIZE / width, MAX_IMAGE_SIZE / height, 1)
-            if scale < 1:
-                width = int(width * scale)
-                height = int(height * scale)
-                print(f"Scaling image down to {width}x{height}")
-
-            # Round image width and height to nearest multiple of 16
-            width = self.make_multiple_of_16(width)
-            height = self.make_multiple_of_16(height)
-            print(f"Input image size set to: {width}x{height}")
-            # Resize
-            init_image = init_image.to(device)
-            init_image = torch.nn.functional.interpolate(init_image, (height, width))
-            init_image = init_image.to(torch.bfloat16)
-            # Set params
-            flux_kwargs["image"] = init_image
-            flux_kwargs["strength"] = prompt_strength
-        else:
-            print("txt2img mode")
-            pipe = self.txt2img_pipe
-
-        generator = torch.Generator("cuda").manual_seed(seed)
-
-        common_args = {
-            "prompt": [prompt] * num_outputs,
-            "guidance_scale": guidance_scale,
-            "generator": generator,
-            "num_inference_steps": num_inference_steps,
-            "max_sequence_length": max_sequence_length,
-            "output_type": "pil"
-        }
-
-        output = pipe(**common_args, **flux_kwargs)
-
-        if not disable_safety_checker:
-            _, has_nsfw_content = self.run_safety_checker(output.images)
-
-        output_paths = []
-        for i, image in enumerate(output.images):
-            if not disable_safety_checker and has_nsfw_content[i]:
-                print(f"NSFW content detected in image {i}")
-                continue
-            output_path = f"/tmp/out-{i}.{output_format}"
-            if output_format != 'png':
-                image.save(output_path, quality=output_quality, optimize=True)
+        print(f"Dimensions: {width}x{height}")
+        
+        # Make sure dimensions are multiples of 16
+        width = self.make_multiple_of_16(width)
+        height = self.make_multiple_of_16(height)
+        
+        # Calculate latent dimensions (1/8 of the image dimensions)
+        latent_height = height // 8
+        latent_width = width // 8
+        
+        # Set up random generators
+        generator1 = torch.Generator(device="cuda").manual_seed(seed1)
+        generator2 = torch.Generator(device="cuda").manual_seed(seed2)
+        
+        # Directly create latent vectors with the known shape [1, 16, 96, 96]
+        latent1 = torch.randn(
+            (1, 16, latent_height, latent_width),
+            generator=generator1,
+            device="cuda"
+        )
+        
+        latent2 = torch.randn(
+            (1, 16, latent_height, latent_width),
+            generator=generator2,
+            device="cuda"
+        )
+        
+        print(f"Created latent1 shape: {latent1.shape}")
+        print(f"Created latent2 shape: {latent2.shape}")
+        
+        # Initialize list to store all generated images
+        all_images = []
+        
+        # Generate images for each interpolation step (including endpoints)
+        total_steps = interpolation_steps
+        
+        for i, t in enumerate(np.linspace(0, interpolation_strength, total_steps + 1)):
+            # For t=0, use latent1 directly
+            if t == 0:
+                current_latent = latent1
             else:
-                image.save(output_path)
-            output_paths.append(Path(output_path))
+                # Interpolate between the latents
+                # Reshape latents to 2D for SLERP
+                latent1_flat = latent1.reshape(1, -1)
+                latent2_flat = latent2.reshape(1, -1)
+                
+                # Apply SLERP
+                interpolated_latent_flat = slerp(t, latent1_flat, latent2_flat)
+                
+                # Reshape back to original shape
+                current_latent = interpolated_latent_flat.reshape(latent1.shape)
+            
+            print(f"Generating image {i+1}/{total_steps+1} with t={t}")
+            
+            # Log detailed shape information
+            print(f"Current latent shape: {current_latent.shape}")
+            print(f"Current latent dtype: {current_latent.dtype}")
+            print(f"Current latent device: {current_latent.device}")
+            
+            # Pack the latents before passing to the transformer
+            # Step 1: View as a 6D tensor with spatially split dimensions
+            packed_latent = current_latent.view(1, 16, latent_height // 2, 2, latent_width // 2, 2)
+            # Step 2: Permute to place spatial dimensions together
+            packed_latent = packed_latent.permute(0, 2, 4, 1, 3, 5)
+            # Step 3: Reshape to final packed form [batch, tokens, channels]
+            packed_latent = packed_latent.reshape(1, (latent_height // 2) * (latent_width // 2), 16 * 4)
+            
+            print(f"Packed latent shape: {packed_latent.shape}")
+            
+            # Generate image with the current latent
+            output = self.pipe(
+                prompt=prompt,
+                guidance_scale=0.0,
+                width=width,
+                height=height,
+                num_inference_steps=4,
+                max_sequence_length=256,
+                latents=packed_latent,
+                output_type="pil"
+            )
+            
+            # Log tensor shapes captured during forward pass
+            print("Tensor shapes during forward pass:")
+            for key, shape in self.tensor_shapes.items():
+                print(f"  {key}: {shape}")
+            
+            all_images.append(output.images[0])
+        
+        # Create output paths for the images
+        image_paths = []
+        # Create output directory if it doesn't exist
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for i, img in enumerate(all_images):
+            image_path = f"{output_dir}/interpolated_{i}.{output_format}"
+            img.save(image_path)
+            image_paths.append(image_path)
+        
+        # Create video if requested
+        if create_video and len(image_paths) > 1:
+            video_path = f"{output_dir}/interpolation_video.mp4"
+            create_video_from_images(image_paths, video_path, fps=fps)
+            return Path(video_path)
+        
+        # Return the first image if only one was generated
+        if len(image_paths) == 1:
+            return Path(image_paths[0])
+        
+        # Return all images as a list
+        return [Path(p) for p in image_paths]
 
-        if len(output_paths) == 0:
-            raise Exception("NSFW content detected. Try running it again, or try a different prompt.")
-
-        return output_paths
+def create_video_from_images(image_paths, output_path, fps=10):
+    """Create a video from a list of image paths using ffmpeg"""
+    # Create a temporary directory for frame numbering
+    tmp_dir = '/tmp/frames'
+    os.makedirs(tmp_dir, exist_ok=True)
     
+    # Copy and rename images with sequential numbering
+    for i, img_path in enumerate(image_paths):
+        # Create a symbolic link with sequential numbering
+        output_frame = f"{tmp_dir}/frame_{i:04d}.{img_path.split('.')[-1]}"
+        # Copy the file instead of creating a symlink
+        subprocess.run(['cp', img_path, output_frame], check=True)
+    
+    # Use ffmpeg to create the video from the sequentially numbered frames
+    cmd = [
+        'ffmpeg', 
+        '-y',  # Overwrite output file if it exists
+        '-framerate', str(fps),
+        '-i', f"{tmp_dir}/frame_%04d.{image_paths[0].split('.')[-1]}", 
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        output_path
+    ]
+    subprocess.run(cmd, check=True)
+    
+    return output_path
+
+
+
+
+# Function for spherical interpolation (SLERP)
+def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
+    """
+    Spherical linear interpolation
+    Args:
+        t: Float value between 0.0 and 1.0
+        v0: Starting vector
+        v1: Final vector
+        DOT_THRESHOLD: Threshold for linear interpolation fallback
+    """
+    # v0 and v1 should be normalized vectors
+    if not isinstance(v0, torch.Tensor):
+        v0 = torch.tensor(v0).float()
+    if not isinstance(v1, torch.Tensor):
+        v1 = torch.tensor(v1).float()
+    
+    # Copy the vectors to reuse them later
+    v0_copy = v0.clone().detach()
+    v1_copy = v1.clone().detach()
+    
+    # Normalize the vectors to get the directions and angles
+    v0 = v0 / torch.norm(v0)
+    v1 = v1 / torch.norm(v1)
+    
+    # Dot product with clamp to stay in range
+    dot = torch.sum(v0 * v1)
+    dot = torch.clamp(dot, -1.0, 1.0)
+    
+    # If the inputs are too close for comfort, linearly interpolate
+    if abs(dot) > DOT_THRESHOLD:
+        return v0_copy + t * (v1_copy - v0_copy)
+    
+    # Calculate initial angle between v0 and v1
+    theta_0 = torch.acos(dot)
+    sin_theta_0 = torch.sin(theta_0)
+    
+    # Angle at timestep t
+    theta_t = theta_0 * t
+    sin_theta_t = torch.sin(theta_t)
+    
+    # Finish the slerp algorithm
+    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
+    s1 = sin_theta_t / sin_theta_0
+    
+    return s0 * v0_copy + s1 * v1_copy

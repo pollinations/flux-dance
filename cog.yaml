@@ -1,4 +1,4 @@
-# Configuration for Cog ⚙️
+# Configuration for Cog 
 # Reference: https://cog.run/yaml
 
 build:
@@ -6,17 +6,18 @@ build:
   cuda: "12.1"
   python_version: "3.11"
   python_packages:
-    - "torch>2.3"
+    - "torch>2.4"
     - "torchvision"
-    - "git+https://github.com/huggingface/diffusers.git@249a9e48e8f8aac4356d5a285c8ba0c600a80f64"
-    - "transformers==4.43.3"
-    - "accelerate==0.33.0"
-    - "sentencepiece==0.2.0"
-    - "protobuf==5.27.3"
-    - "numpy==1.26.4"
-    - "pillow==10.4.0"
+    - "diffusers"
+    - "transformers"
+    - "accelerate"
+    - "sentencepiece"
+    - "protobuf"
+    - "numpy"
+    - "pillow"
 
   run:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/latest/download/pget_$(uname -s)_$(uname -m)" && chmod +x /usr/local/bin/pget
+    - apt-get update && apt-get install -y ffmpeg
 
 predict: "predict.py:Predictor"
