@@ -118,7 +118,7 @@ class Predictor(BasePredictor):
             audio_file: Path to the audio file
             frame_rate: Number of frames per second to extract
             smoothing: Smoothing factor (0-1), higher values mean more smoothing
-            noise_scale: Scale factor for the audio amplitudes
+            noise_scale: Scale factor for the audio amplitudes (same as variation_strength)
             loudness_type: Type of loudness measurement ('peak' or 'rms')
             
         Returns:
@@ -173,34 +173,32 @@ class Predictor(BasePredictor):
     @torch.inference_mode()
     def generate_interpolated_images(
         self,
-        prompt: str,
+        prompts: Union[str, List[str]],
         width: int,
         height: int,
-        seed1: int,
-        seed2: int,
+        seed: int,
         interpolation_steps: int = None,
-        interpolation_strength: float = None,
+        variation_strength: float = None,
         audio_file: Path = None,
         audio_smoothing: float = 0.8,
-        audio_noise_scale: float = 0.3,
         audio_loudness_type: str = "peak",
         fps: int = 10,
+        style_prefix: str = "",
     ) -> List[Image.Image]:
         """Generate a series of interpolated images between two random seeds.
         
         Args:
-            prompt: Text prompt for image generation
+            prompts: Text prompt(s) for image generation (single string or list of strings)
             width: Width of the generated image
             height: Height of the generated image
-            seed1: First random seed for interpolation
-            seed2: Second random seed for interpolation
+            seed: Random seed for interpolation (seed+1 will be used as the second seed)
             interpolation_steps: Number of interpolation steps between seeds (ignored if audio_file is provided)
-            interpolation_strength: How far to interpolate towards the second seed (ignored if audio_file is provided)
+            variation_strength: Controls the amount of variation between frames (0-1)
             audio_file: Path to audio file for audio-driven interpolation
             audio_smoothing: Smoothing factor for audio amplitudes
-            audio_noise_scale: Scale factor for audio amplitudes
             audio_loudness_type: Type of loudness measurement ('peak' or 'rms')
             fps: Frames per second for audio-driven interpolation
+            style_prefix: Style prefix to prepend to each prompt
             
         Returns:
             List of PIL images generated through interpolation
@@ -213,7 +211,10 @@ class Predictor(BasePredictor):
         latent_height = height // 8
         latent_width = width // 8
         
-        # Set up random generators
+        # Set up random generators with seed and seed+1
+        seed1 = seed
+        seed2 = seed + 1
+        
         generator1 = torch.Generator(device="cuda").manual_seed(seed1)
         generator2 = torch.Generator(device="cuda").manual_seed(seed2)
         
@@ -230,8 +231,8 @@ class Predictor(BasePredictor):
             device="cuda"
         )
         
-        print(f"Created latent1 shape: {latent1.shape}")
-        print(f"Created latent2 shape: {latent2.shape}")
+        print(f"Created latent1 with seed {seed1}, shape: {latent1.shape}")
+        print(f"Created latent2 with seed {seed2}, shape: {latent2.shape}")
         
         # Initialize list to store all generated images
         all_images = []
@@ -243,7 +244,7 @@ class Predictor(BasePredictor):
                 audio_file, 
                 frame_rate=fps,
                 smoothing=audio_smoothing,
-                noise_scale=audio_noise_scale,
+                noise_scale=variation_strength,  # Use variation_strength instead of audio_noise_scale
                 loudness_type=audio_loudness_type
             )
             total_steps = len(interpolation_values)
@@ -251,9 +252,53 @@ class Predictor(BasePredictor):
         else:
             # Use linear interpolation with fixed steps
             total_steps = interpolation_steps
-            interpolation_values = np.linspace(0, interpolation_strength, total_steps + 1)
+            interpolation_values = np.linspace(0, variation_strength, total_steps + 1)
             print(f"Using fixed interpolation with {total_steps} steps")
         
+        # Handle multiple prompts if provided
+        if isinstance(prompts, list):
+            # If we have multiple prompts, we need to determine which prompt to use for each frame
+            if len(prompts) == 1:
+                # If only one prompt, use it for all frames
+                prompt_for_frame = [prompts[0]] * len(interpolation_values)
+            else:
+                # If we have multiple prompts, distribute them across the frames
+                prompt_for_frame = []
+                num_frames_per_prompt = len(interpolation_values) // (len(prompts) - 1)
+                
+                # Handle edge case where we have more prompts than frames
+                if num_frames_per_prompt == 0:
+                    num_frames_per_prompt = 1
+                    # Truncate prompts list if needed
+                    prompts = prompts[:len(interpolation_values) + 1]
+                
+                # For each pair of consecutive prompts
+                for i in range(len(prompts) - 1):
+                    # Calculate the number of frames for this prompt pair
+                    if i == len(prompts) - 2:
+                        # Last pair gets all remaining frames
+                        frames_for_pair = len(interpolation_values) - len(prompt_for_frame)
+                    else:
+                        frames_for_pair = num_frames_per_prompt
+                    
+                    # Distribute frames between current prompt and next prompt
+                    for j in range(frames_for_pair):
+                        # Calculate interpolation factor between prompts
+                        t_prompt = j / frames_for_pair
+                        # For simplicity, we're not interpolating between prompts,
+                        # just using the first prompt for the first half and second for the second half
+                        if t_prompt < 0.5:
+                            prompt_for_frame.append(prompts[i])
+                        else:
+                            prompt_for_frame.append(prompts[i + 1])
+        else:
+            # Single prompt for all frames
+            prompt_for_frame = [prompts] * len(interpolation_values)
+        
+        # Apply style prefix if provided
+        if style_prefix:
+            prompt_for_frame = [f"{style_prefix} {prompt}" for prompt in prompt_for_frame]
+            
         # Generate images for each interpolation step
         for i, t in enumerate(interpolation_values):
             # For t=0, use latent1 directly
@@ -271,7 +316,8 @@ class Predictor(BasePredictor):
                 # Reshape back to original shape
                 current_latent = interpolated_latent_flat.reshape(latent1.shape)
             
-            print(f"Generating image {i+1}/{len(interpolation_values)} with t={t}")
+            current_prompt = prompt_for_frame[i]
+            print(f"Generating image {i+1}/{len(interpolation_values)} with t={t}, prompt: {current_prompt}")
             
             # Log detailed shape information
             print(f"Current latent shape: {current_latent.shape}")
@@ -290,7 +336,7 @@ class Predictor(BasePredictor):
             
             # Generate image with the current latent
             output = self.pipe(
-                prompt=prompt,
+                prompt=current_prompt,
                 guidance_scale=0.0,
                 width=width,
                 height=height,
@@ -312,16 +358,22 @@ class Predictor(BasePredictor):
     @torch.inference_mode()
     def predict(
         self,
-        prompt: str = Input(description="Prompt for generated image"),
-        width: int = Input(description="Width of the generated image", default=768),
-        height: int = Input(description="Height of the generated image", default=768),
-        seed1: int = Input(description="First random seed for interpolation", default=1234567890),
-        seed2: int = Input(description="Second random seed for interpolation", default=9876543210),
+        style_prefix: str = Input(
+            description="Style prefix to prepend to each prompt", 
+            default="A painting by paul klee, intricate details of"),
+        prompt: str = Input(description="Prompt for generated image", default="A beautiful landscape"),
+        narrative: str = Input(
+            description="Narrative prompts, one per line. Each line defines a prompt for a certain time in the sequence.", 
+            default="""A painting of a moth
+A painting of a killer dragonfly
+Two fishes talking to eachother in deep sea"""),
+        width: int = Input(description="Width of the generated image", default=1024),
+        height: int = Input(description="Height of the generated image", default=1024),
+        seed: int = Input(description="Random seed for interpolation (seed+1 will be used as the second seed)", default=42),
         interpolation_steps: int = Input(description="Number of interpolation steps between seeds (ignored if audio_file is provided)", default=4),
-        interpolation_strength: float = Input(description="How far to interpolate towards the second seed (0.05 = 5%) (ignored if audio_file is provided)", default=0.05),
+        variation_strength: float = Input(description="Controls the amount of variation between frames (0-1)", default=0.3),
         audio_file: Path = Input(description="Audio file to drive interpolation (optional)", default=None),
         audio_smoothing: float = Input(description="Smoothing factor for audio (0-1, higher = more smoothing)", default=0.8),
-        audio_noise_scale: float = Input(description="Scale factor for audio influence (0-1)", default=0.3),
         audio_loudness_type: str = Input(
             description="Type of audio loudness measurement to use",
             choices=["peak", "rms"],
@@ -335,38 +387,51 @@ class Predictor(BasePredictor):
             default="png",
         ),
     ) -> Path:
-        print(f"Using seed1: {seed1}")
-        print(f"Using seed2: {seed2}")
+        print(f"Using seed: {seed} (and {seed+1} as second seed)")
         
         if audio_file:
             print(f"Using audio file: {audio_file}")
             print(f"Audio smoothing: {audio_smoothing}")
-            print(f"Audio noise scale: {audio_noise_scale}")
+            print(f"Variation strength: {variation_strength}")
             print(f"Audio loudness type: {audio_loudness_type}")
             print(f"FPS: {fps}")
         else:
             print(f"Interpolation steps: {interpolation_steps}")
-            print(f"Interpolation strength: {interpolation_strength * 100}%")
-            
-        print(f"Prompt: {prompt}")
+            print(f"Variation strength: {variation_strength * 100}%")
+        
+        # Process prompts
+        if narrative:
+            # Split narrative into individual prompts
+            prompts = [p.strip() for p in narrative.strip().split('\n') if p.strip()]
+            if len(prompts) == 0:
+                # If narrative is empty or invalid, fall back to single prompt
+                prompts = [prompt]
+            print(f"Using narrative with {len(prompts)} prompts")
+        else:
+            # Use single prompt
+            prompts = [prompt]
+            print(f"Using single prompt: {prompt}")
+        
+        if style_prefix:
+            print(f"Applying style prefix to all prompts: {style_prefix}")
+        
         print(f"Dimensions: {width}x{height}")
         
         # Create a temporary directory for the output
         with tempfile.TemporaryDirectory() as output_dir:
             # Generate interpolated images
             images = self.generate_interpolated_images(
-                prompt=prompt,
+                prompts=prompts,
                 width=width,
                 height=height,
-                seed1=seed1,
-                seed2=seed2,
+                seed=seed,
                 interpolation_steps=interpolation_steps,
-                interpolation_strength=interpolation_strength,
+                variation_strength=variation_strength,
                 audio_file=audio_file,
                 audio_smoothing=audio_smoothing,
-                audio_noise_scale=audio_noise_scale,
                 audio_loudness_type=audio_loudness_type,
                 fps=fps,
+                style_prefix=style_prefix,
             )
             
             # Save images to temporary directory
