@@ -420,11 +420,11 @@ class Predictor(BasePredictor):
         self,
         style_prefix: str = Input(
             description="Style prefix to prepend to each prompt", 
-            default="unsplash, crystal cubism, angular, academic art, cubism, an abstract drawing by Svetoslav Roerich, reddit contest winner, abstract illusionism, concept art, angular, apocalypse landscape broken-stained-glass, digital lines, ((woodblock)), concrete poetry, anton semono. black and white, granular, abstract, hand drawings, old, grainy, retro, art album, fade, drawing on paper, stone texture, wood texture, lava texture, mysticism, sacred symbology, blueprint, ancient document, buddhism, erosion, decay, prism, rage, fade."),
+            default="angular, academic art, cubism, an abstract drawing by Svetoslav Roerich,  abstract illusionism, concept art, angular, broken-stained-glass, concrete poetry, anton semono. black and white, granular, abstract, hand drawings,grainy, dmysticism, sacred symbology, blueprint"),
         narrative: str = Input(
             description="Narrative prompts, one per line. Each line defines a prompt for a certain time in the sequence.", 
-            default="""granular Silhouettes of valleys 
-Granular Silhouettes of hills"""),
+            default="""Silhouettes of valleys 
+Silhouettes of hills"""),
         audio_file: Path = Input(description="Audio file to drive interpolation (optional)", default=None),
         width: int = Input(description="Width of the generated image", default=512),
         height: int = Input(description="Height of the generated image", default=512),
