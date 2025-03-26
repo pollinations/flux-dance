@@ -8,7 +8,11 @@ import torch
 import subprocess
 import numpy as np
 from typing import List, Union
-from diffusers import FluxPipeline
+from diffusers import FluxPipeline, FlowMatchEulerDiscreteScheduler, AutoencoderKL, GGUFQuantizationConfig
+from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from optimum.quanto import freeze, qfloat8, quantize
+from huggingface_hub import hf_hub_download, snapshot_download
 from PIL import Image
 import shutil
 import tempfile
@@ -16,8 +20,11 @@ import librosa
 
 MODEL_CACHE = "FLUX.1-schnell"
 MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
-HALF_PRECISION_CACHE = "FLUX.1-schnell-fp16"  # New location for half precision model
-# INT8_CACHE = "FLUX.1-schnell-int8"  # New INT8 quantized model path (commented out)
+HALF_PRECISION_CACHE = "FLUX.1-schnell-fp16"  # Location for half precision model
+GGUF_MODEL_ID = "city96/FLUX.1-schnell-gguf"  # HuggingFace GGUF model ID
+GGUF_MODEL_FILE = "flux1-schnell-Q6_K.gguf"   # GGUF model filename
+BFL_REPO = "black-forest-labs/FLUX.1-schnell" # Original model repo
+REVISION = "refs/pr/1"                        # Revision for the original model
 
 def download_weights(url, dest):
     start = time.time()
@@ -26,46 +33,28 @@ def download_weights(url, dest):
     subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
     print("downloading took: ", time.time() - start)
 
-# def convert_to_int8():
-#     """Convert the model to INT8 quantization using the conversion script"""
-#     print("Converting model to INT8 quantization...")
-#     try:
-#         # Check if the conversion script exists
-#         if not os.path.exists("convert_model_int8.py"):
-#             print("INT8 conversion script not found, skipping conversion")
-#             return False
-            
-#         # Run the conversion script
-#         result = subprocess.run(
-#             ["python3", "convert_model_int8.py"], 
-#             capture_output=True, 
-#             text=True,
-#             check=True
-#         )
-#         print(result.stdout)
-#         return os.path.exists(INT8_CACHE)
-#     except subprocess.CalledProcessError as e:
-#         print(f"Error converting model to INT8: {e}")
-#         print(f"Error output: {e.stderr}")
-#         return False
+def download_hf_model(model_id, local_path):
+    """Download model from HuggingFace to local path"""
+    start = time.time()
+    print(f"Downloading model {model_id} to {local_path}...")
+    
+    # Create directory if it doesn't exist
+    os.makedirs(local_path, exist_ok=True)
+    
+    # Download the model files
+    snapshot_download(
+        repo_id=model_id,
+        local_dir=local_path,
+        local_dir_use_symlinks=False
+    )
+    
+    print(f"Download completed in {time.time() - start:.2f} seconds")
+    return os.path.exists(local_path)
 
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
         start_time = time.time()
-        
-        # Check for models in order of preference: FP16, original
-        if os.path.exists(HALF_PRECISION_CACHE):
-            print(f"Loading half precision model from {HALF_PRECISION_CACHE}")
-            model_path = HALF_PRECISION_CACHE
-        else:
-            # Download original model if needed
-            if not os.path.exists(MODEL_CACHE):
-                download_weights(MODEL_URL, MODEL_CACHE)
-            
-            # Use original model path
-            print(f"Using original model from {MODEL_CACHE}")
-            model_path = MODEL_CACHE
         
         # Enable TensorFloat-32 for faster computation on Ampere GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -73,17 +62,25 @@ class Predictor(BasePredictor):
         # Set memory optimization settings
         torch.cuda.empty_cache()
         
-        # Load the model with memory optimizations
-        print(f"Loading Flux.schnell Pipeline from {model_path}")
-        self.pipe = FluxPipeline.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,  # Use half precision
-            low_cpu_mem_usage=True,     # Optimize CPU memory usage during loading
-        )
-        
-        # Move to CUDA in a memory-efficient way
-        print("Moving model to CUDA...")
-        self.pipe.to("cuda")
+        # Try to load the GGUF model first
+        try:
+            print(f"Attempting to load GGUF model from {GGUF_MODEL_ID}")
+            self.load_gguf_model()
+        except Exception as e:
+            print(f"Failed to load GGUF model: {e}")
+            
+            # Fall back to half precision model if available
+            if os.path.exists(HALF_PRECISION_CACHE):
+                print(f"Loading half precision model from {HALF_PRECISION_CACHE}")
+                self.load_standard_model(HALF_PRECISION_CACHE)
+            else:
+                # Download original model if needed
+                if not os.path.exists(MODEL_CACHE):
+                    download_weights(MODEL_URL, MODEL_CACHE)
+                
+                # Use original model path
+                print(f"Using original model from {MODEL_CACHE}")
+                self.load_standard_model(MODEL_CACHE)
         
         # Add hooks to log tensor shapes during forward pass
         self.tensor_shapes = {}
@@ -104,7 +101,51 @@ class Predictor(BasePredictor):
                 self.pipe.transformer.x_embedder.register_forward_hook(log_shape_hook("x_embedder"))
         
         print(f"setup took: ", time.time() - start_time)
-
+    
+    def load_standard_model(self, model_path):
+        """Load the standard model using diffusers pipeline"""
+        print(f"Loading Flux.schnell Pipeline from {model_path}")
+        self.pipe = FluxPipeline.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,  # Use half precision
+            low_cpu_mem_usage=True,     # Optimize CPU memory usage during loading
+        )
+        
+        # Move to CUDA in a memory-efficient way
+        print("Moving model to CUDA...")
+        self.pipe.to("cuda")
+    
+    def load_gguf_model(self):
+        """Load the GGUF quantized model from HuggingFace"""
+        print("Loading GGUF quantized model...")
+        
+        # Download the GGUF model file if needed
+        gguf_path = hf_hub_download(
+            repo_id=GGUF_MODEL_ID,
+            filename=GGUF_MODEL_FILE
+        )
+        
+        print(f"GGUF model downloaded to: {gguf_path}")
+        
+        # Load the transformer with GGUF quantization
+        transformer = FluxTransformer2DModel.from_single_file(
+            gguf_path,
+            quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+            torch_dtype=torch.bfloat16
+        )
+        
+        # Load the rest of the pipeline components
+        self.pipe = FluxPipeline.from_pretrained(
+            BFL_REPO,
+            transformer=transformer,
+            torch_dtype=torch.bfloat16,
+            revision=REVISION
+        )
+        
+        # Enable model CPU offload to save GPU memory
+        self.pipe.enable_model_cpu_offload()
+        print("GGUF model loaded successfully")
+    
     @staticmethod
     def make_multiple_of_16(n):
         """Make sure width and height are multiples of 16 for the model"""
@@ -130,45 +171,36 @@ class Predictor(BasePredictor):
         # Calculate hop length based on frame rate
         hop_length = int(22050 / frame_rate)
         
-        # Initialize smoothed intensity
-        smoothed_intensity = 0
-        smoothed_intensities = []
-        
+        # Get amplitude measurements based on loudness type
         if loudness_type == "peak":
-            # Get amplitude envelope
-            amplitude_envelope = []
-            
-            # Calculate amplitude envelope for each frame
-            for i in range(0, len(y), hop_length):
-                current_frame = np.abs(y[i:i+hop_length])
-                if len(current_frame) > 0:
-                    amplitude_envelope_current_frame = np.max(current_frame)
-                    amplitude_envelope.append(amplitude_envelope_current_frame)
-            
-            # Convert to numpy array
-            amplitude_envelope = np.array(amplitude_envelope)
-            
-            # Normalize
-            if amplitude_envelope.max() > 0:
-                normalized_amplitudes = amplitude_envelope / amplitude_envelope.max()
-            else:
-                normalized_amplitudes = np.zeros_like(amplitude_envelope)
+            # Use numpy's efficient array operations instead of loops
+            # Reshape audio into frames
+            frames = librosa.util.frame(y, frame_length=hop_length, hop_length=hop_length).T
+            # Get maximum absolute value for each frame (peak amplitude)
+            amplitudes = np.max(np.abs(frames), axis=1)
         else:
-            # Get RMS (root mean square) - energy
-            rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length)
+            # Use librosa's built-in RMS function (much faster)
+            amplitudes = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length)[0]
+        
+        # Normalize in one step
+        if np.max(amplitudes) > 0:
+            normalized_amplitudes = amplitudes / np.max(amplitudes)
+        else:
+            normalized_amplitudes = np.zeros_like(amplitudes)
+        
+        # Apply smoothing using vectorized operations
+        if smoothing > 0:
+            # Use exponential moving average for smoothing
+            smoothed = np.zeros_like(normalized_amplitudes)
+            smoothed[0] = normalized_amplitudes[0]
+            for i in range(1, len(normalized_amplitudes)):
+                smoothed[i] = smoothing * smoothed[i-1] + (1 - smoothing) * normalized_amplitudes[i]
             
-            # Normalize
-            if rms[0].max() > 0:
-                normalized_amplitudes = rms[0] / rms[0].max()
-            else:
-                normalized_amplitudes = np.zeros_like(rms[0])
-        
-        # Apply smoothing and scaling
-        for amplitude in normalized_amplitudes:
-            smoothed_intensity = (smoothed_intensity * smoothing) + (amplitude * (1 - smoothing))
-            smoothed_intensities.append(smoothed_intensity * noise_scale)
-        
-        return np.array(smoothed_intensities)
+            # Apply noise scale
+            return smoothed * noise_scale
+        else:
+            # If no smoothing, just apply noise scale directly
+            return normalized_amplitudes * noise_scale
 
     @torch.inference_mode()
     def generate_interpolated_images(
@@ -231,8 +263,8 @@ class Predictor(BasePredictor):
             device="cuda"
         )
         
-        print(f"Created latent1 with seed {seed1}, shape: {latent1.shape}")
-        print(f"Created latent2 with seed {seed2}, shape: {latent2.shape}")
+        print(f"Created latent1 with seed {seed1}")#, shape: {latent1.shape}")
+        print(f"Created latent2 with seed {seed2}")#, shape: {latent2.shape}")
         
         # Initialize list to store all generated images
         all_images = []
@@ -240,6 +272,7 @@ class Predictor(BasePredictor):
         # Determine interpolation values based on audio file or steps
         if audio_file is not None:
             # Get audio amplitudes to drive interpolation
+            print(f"Using audio file {audio_file} for interpolation. Getting amplitudes...")
             interpolation_values = self.get_audio_amplitudes(
                 audio_file, 
                 frame_rate=fps,
@@ -299,6 +332,41 @@ class Predictor(BasePredictor):
         if style_prefix:
             prompt_for_frame = [f"{style_prefix} {prompt}" for prompt in prompt_for_frame]
             
+        # Pre-compute prompt embeddings for each unique prompt
+        unique_prompts = list(set(prompt_for_frame))
+        print(f"Pre-computing embeddings for {len(unique_prompts)} unique prompts...")
+        prompt_embeddings = {}
+        
+        for unique_prompt in unique_prompts:
+            # # Tokenize the prompt
+            # text_inputs = self.pipe.tokenizer(
+            #     unique_prompt,
+            #     padding="max_length",
+            #     max_length=self.pipe.tokenizer.model_max_length,
+            #     max_sequence_length=256,
+            #     truncation=True,
+            #     return_tensors="pt",
+            # ).to("cuda")
+            
+            # # Generate the prompt embeddings
+            # with torch.no_grad():
+            #     prompt_embeds = self.pipe.text_encoder(
+            #         text_inputs.input_ids,
+            #         attention_mask=text_inputs.attention_mask,
+            #     ).last_hidden_state
+            
+            # # Store the embeddings
+            # prompt_embeddings[unique_prompt] = prompt_embeds
+            
+            prompt_embeds, pooled_prompt_embeds, _text_ids = self.pipe.encode_prompt(
+                prompt=unique_prompt, prompt_2=None, max_sequence_length=256
+            )
+            
+            # Store the embeddings
+            prompt_embeddings[unique_prompt] = (prompt_embeds, pooled_prompt_embeds)
+
+        print(f"Finished pre-computing prompt embeddings")
+            
         # Generate images for each interpolation step
         for i, t in enumerate(interpolation_values):
             # For t=0, use latent1 directly
@@ -319,11 +387,7 @@ class Predictor(BasePredictor):
             current_prompt = prompt_for_frame[i]
             print(f"Generating image {i+1}/{len(interpolation_values)} with t={t}, prompt: {current_prompt}")
             
-            # Log detailed shape information
-            print(f"Current latent shape: {current_latent.shape}")
-            print(f"Current latent dtype: {current_latent.dtype}")
-            print(f"Current latent device: {current_latent.device}")
-            
+            print("Packing latents...")
             # Pack the latents before passing to the transformer
             # Step 1: View as a 6D tensor with spatially split dimensions
             packed_latent = current_latent.view(1, 16, latent_height // 2, 2, latent_width // 2, 2)
@@ -332,11 +396,12 @@ class Predictor(BasePredictor):
             # Step 3: Reshape to final packed form [batch, tokens, channels]
             packed_latent = packed_latent.reshape(1, (latent_height // 2) * (latent_width // 2), 16 * 4)
             
-            print(f"Packed latent shape: {packed_latent.shape}")
+            print(f"Packed latent")
             
-            # Generate image with the current latent
+            # Use the pre-computed prompt embeddings instead of passing the prompt text
             output = self.pipe(
-                prompt=current_prompt,
+                prompt_embeds=prompt_embeddings[current_prompt][0],
+                pooled_prompt_embeds=prompt_embeddings[current_prompt][1],
                 guidance_scale=0.0,
                 width=width,
                 height=height,
@@ -345,11 +410,6 @@ class Predictor(BasePredictor):
                 latents=packed_latent,
                 output_type="pil"
             )
-            
-            # Log tensor shapes captured during forward pass
-            print("Tensor shapes during forward pass:")
-            for key, shape in self.tensor_shapes.items():
-                print(f"  {key}: {shape}")
             
             all_images.append(output.images[0])
             
@@ -360,19 +420,17 @@ class Predictor(BasePredictor):
         self,
         style_prefix: str = Input(
             description="Style prefix to prepend to each prompt", 
-            default="A painting by paul klee, intricate details of"),
-        prompt: str = Input(description="Prompt for generated image", default="A beautiful landscape"),
+            default="unsplash, crystal cubism, angular, academic art, cubism, an abstract drawing by Svetoslav Roerich, reddit contest winner, abstract illusionism, concept art, angular, apocalypse landscape broken-stained-glass, digital lines, ((woodblock)), concrete poetry, anton semono. black and white, granular, abstract, hand drawings, old, grainy, retro, art album, fade, drawing on paper, stone texture, wood texture, lava texture, mysticism, sacred symbology, blueprint, ancient document, buddhism, erosion, decay, prism, rage, fade."),
         narrative: str = Input(
             description="Narrative prompts, one per line. Each line defines a prompt for a certain time in the sequence.", 
-            default="""A painting of a moth
-A painting of a killer dragonfly
-Two fishes talking to eachother in deep sea"""),
-        width: int = Input(description="Width of the generated image", default=1024),
-        height: int = Input(description="Height of the generated image", default=1024),
+            default="""granular Silhouettes of valleys 
+Granular Silhouettes of hills"""),
+        audio_file: Path = Input(description="Audio file to drive interpolation (optional)", default=None),
+        width: int = Input(description="Width of the generated image", default=512),
+        height: int = Input(description="Height of the generated image", default=512),
         seed: int = Input(description="Random seed for interpolation (seed+1 will be used as the second seed)", default=42),
         interpolation_steps: int = Input(description="Number of interpolation steps between seeds (ignored if audio_file is provided)", default=4),
         variation_strength: float = Input(description="Controls the amount of variation between frames (0-1)", default=0.3),
-        audio_file: Path = Input(description="Audio file to drive interpolation (optional)", default=None),
         audio_smoothing: float = Input(description="Smoothing factor for audio (0-1, higher = more smoothing)", default=0.8),
         audio_loudness_type: str = Input(
             description="Type of audio loudness measurement to use",
@@ -404,13 +462,10 @@ Two fishes talking to eachother in deep sea"""),
             # Split narrative into individual prompts
             prompts = [p.strip() for p in narrative.strip().split('\n') if p.strip()]
             if len(prompts) == 0:
-                # If narrative is empty or invalid, fall back to single prompt
-                prompts = [prompt]
+                raise ValueError("Narrative cannot be empty")
             print(f"Using narrative with {len(prompts)} prompts")
         else:
-            # Use single prompt
-            prompts = [prompt]
-            print(f"Using single prompt: {prompt}")
+            raise ValueError("Narrative is required")
         
         if style_prefix:
             print(f"Applying style prefix to all prompts: {style_prefix}")
